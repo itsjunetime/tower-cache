@@ -37,7 +37,7 @@ impl Invalidator {
 		self.invalidate_all_with_pred(|key| key.1 == *path);
 	}
 
-	fn invalidate_all_with_pred(&self, pred: impl Fn(&CacheKey) -> bool) {
+	pub fn invalidate_all_with_pred(&self, pred: impl Fn(&CacheKey) -> bool) {
 		let valids = self.valids.read().unwrap_or_else(PoisonError::into_inner);
 		for (_, entry) in valids.iter().filter(|(k, _)| pred(k)) {
 			entry.store(false, Ordering::Relaxed);
