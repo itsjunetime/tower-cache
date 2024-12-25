@@ -70,6 +70,10 @@ where
 			_response: PhantomData
 		}
 	}
+
+    pub fn invalidator(&self) -> Invalidator {
+        self.invalidator.clone()
+    }
 }
 
 /// A simple trait to facilitate caching conditions. Specifically, values implementing this trait
