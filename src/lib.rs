@@ -1,21 +1,29 @@
 #![feature(mapped_lock_guards)]
 #![doc = include_str!("../README.md")]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use std::{
+use core::{
 	future::Future,
 	marker::PhantomData,
 	pin::Pin,
-	sync::Arc,
+	sync::atomic::{AtomicBool, Ordering},
 	task::{Context, Poll}
 };
+use std::{
+	collections::VecDeque,
+	sync::{
+		mpsc::{channel, Receiver, Sender, TryRecvError},
+		Arc
+	}
+};
 
-use http::{Method, Request, Uri};
+use body::{BodyMessage, CacheStreamBody, CachedBody, MaybeCachedBody, NoOpBody};
+use http::{HeaderMap, Method, Request, Response, Uri};
 use options::{CacheOptions, Predicate};
 use pin_project_lite::pin_project;
 use tower_layer::Layer;
 use tower_service::Service;
 
+pub mod body;
 pub mod cache;
 pub mod invalidator;
 pub mod options;
@@ -51,22 +59,22 @@ pub mod options;
 /// - `Cache`: implementor of [`cache::Cache`] which will be created on a per-service basis to
 ///   cache the response per-service.
 /// - `Resp`, `RespPred`, `Req`, `ReqPred`: See the [`options::CacheOptions`] documentation
-pub struct CacheLayer<Cache, Resp, RespPred, Req, ReqPred>
+pub struct CacheLayer<Body, Cache, RespPred, Req, ReqPred>
 where
-	RespPred: Predicate<Resp>,
+	RespPred: Predicate<Resp<Body>>,
 	ReqPred: Predicate<Req>
 {
-	options: CacheOptions<Resp, RespPred, Req, ReqPred>,
+	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>,
 	_tys: PhantomData<(Req, Cache)>
 }
 
-impl<Cache, Resp, RespPred, Req, ReqPred> CacheLayer<Cache, Resp, RespPred, Req, ReqPred>
+impl<Body, Cache, RespPred, Req, ReqPred> CacheLayer<Body, Cache, RespPred, Req, ReqPred>
 where
-	RespPred: Predicate<Resp>,
+	RespPred: Predicate<Resp<Body>>,
 	ReqPred: Predicate<Req>
 {
 	/// Create a new [`CacheLayer`] with the given options
-	pub fn new(options: CacheOptions<Resp, RespPred, Req, ReqPred>) -> Self {
+	pub fn new(options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>) -> Self {
 		Self {
 			options,
 			_tys: PhantomData
@@ -74,22 +82,25 @@ where
 	}
 }
 
-impl<Cache, RespPred, Req, ReqPred, Svc> Layer<Svc>
-	for CacheLayer<Cache, Svc::Response, RespPred, Req, ReqPred>
+impl<Body, Cache, RespPred, Req, ReqPred, Svc> Layer<Svc>
+	for CacheLayer<Body, Cache, RespPred, Req, ReqPred>
 where
 	Svc: Service<Req>,
-	Svc::Response: Clone,
-	Cache: cache::Cache<CacheKey, Svc::Response>,
-	RespPred: Predicate<Svc::Response>,
+	Cache: cache::Cache<CacheKey, CachedResp>,
+	RespPred: Predicate<Resp<Body>>,
 	ReqPred: Predicate<Req>
 {
-	type Service = CacheService<Cache, RespPred, Req, ReqPred, Svc>;
+	type Service = CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>;
 
 	fn layer(&self, inner: Svc) -> Self::Service {
+		let (sender, receiver) = channel();
 		CacheService {
 			inner,
 			cache: Cache::default(),
 			registered_with_invalidator: Vec::new(),
+			sender: Some(sender),
+			receiver,
+			in_progress_resp: None,
 			options: self.options.clone()
 		}
 	}
@@ -106,32 +117,35 @@ where
 ///   response which it may or may not cache.
 /// - `RespPred`, `Req`, `ReqPred`: See [`options::CacheOptions`] documentation. The missing `Resp`
 ///   type is just [`Svc::Response`](tower_service::Service::Response)
-pub struct CacheService<Cache, RespPred, Req, ReqPred, Svc>
+pub struct CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>
 where
-	RespPred: Predicate<Svc::Response>,
+	RespPred: Predicate<Resp<Body>>,
 	ReqPred: Predicate<Req>,
 	Svc: Service<Req>
 {
 	inner: Svc,
 	cache: Cache,
 	registered_with_invalidator: Vec<(CacheKey, Arc<AtomicBool>)>,
-	options: CacheOptions<Svc::Response, RespPred, Req, ReqPred>
+	sender: Option<Sender<BodyMessage>>,
+	receiver: Receiver<BodyMessage>,
+	in_progress_resp: Option<(http::Response<NoOpBody>, VecDeque<u8>, HeaderMap)>,
+	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>
 }
 
-impl<Cache, RespPred, Req, ReqPred, Svc> Service<Request<Req>>
-	for CacheService<Cache, RespPred, Request<Req>, ReqPred, Svc>
+impl<Body, Cache, RespPred, Req, ReqPred, Svc> Service<Request<Req>>
+	for CacheService<Body, Cache, RespPred, Request<Req>, ReqPred, Svc>
 where
-	Svc: Service<Request<Req>>,
-	Svc::Response: Clone,
+	Svc: Service<Request<Req>, Response = http::Response<Body>>,
+	Body: http_body::Body,
 	Svc::Error: Clone,
 	Svc::Future: Future,
-	Cache: cache::Cache<CacheKey, Svc::Response>,
-	RespPred: Predicate<Svc::Response>,
+	Cache: cache::Cache<CacheKey, CachedResp>,
+	RespPred: Predicate<Resp<Body>>,
 	ReqPred: Predicate<Request<Req>>
 {
-	type Response = Svc::Response;
+	type Response = Resp<Body>;
 	type Error = Svc::Error;
-	type Future = CachingFut<Cache, Svc::Error, Svc::Future, Svc::Response, RespPred>;
+	type Future = CachingFut<Body, Cache, Svc::Error, Svc::Future, RespPred>;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		self.inner.poll_ready(cx)
@@ -140,25 +154,92 @@ where
 	fn call(&mut self, req: Request<Req>) -> Self::Future {
 		let key = (req.method().clone(), req.uri().clone());
 
+		// First, we need to see if it's been invalidated since we last got a request to this
+		// handler. To do that, we need to check if we've already handled a request wth this key.
+		// 'Cause if we haven't handled a request with this key, there's nothing to invalidate
+		// anyways.
 		let invalidated = self
 			.registered_with_invalidator
 			.iter()
 			.find(|(k, _)| *k == key)
 			.map(|(_, valid)| valid);
 
+		// So. If we did get the bool that indicates whether it's been invaidated or not, we want
+		// to check if and remove the cached response if it's been invalidated.
 		match invalidated {
 			Some(valid) =>
 				if !valid.load(Ordering::Relaxed) {
 					self.cache.remove(&key);
 					valid.store(true, Ordering::Relaxed);
 				},
+			// If we haven't yet received a request with this key, though, we need to indicate that
+			// we now have so it can be invalidated in the future.
 			None => {
 				let valid = self.options.invalidator.insert(key.clone());
 				self.registered_with_invalidator.push((key.clone(), valid));
 			}
 		}
 
-		let fulfilled_req_pred = self
+		let next_msg = match self.receiver.try_recv() {
+			Ok(msg) => match msg {
+				BodyMessage::Shell(shell) => {
+					self.in_progress_resp =
+						Some((shell, VecDeque::default(), HeaderMap::default()));
+					None
+				}
+				msg => Some(msg)
+			},
+			Err(TryRecvError::Empty) => None,
+			// This shouldn't happen ever. There should always either be a Sender in this struct,
+			// in a Fut, or within the channel (being sent back to this struct)
+			Err(TryRecvError::Disconnected) => unreachable!()
+		};
+
+		let mut cache_partial_as_done = false;
+		if let Some((_, ref mut partial_data, ref mut partial_trailers)) =
+			self.in_progress_resp.as_mut()
+		{
+			let mut handle_msg = |msg: BodyMessage| {
+				match msg {
+					// If we handle a Shell here, that's a bug - we either didn't handle it up
+					// above as we should've, or we loaned a sender out to two futs at the same
+					// time and they're sending us response data at the same time (we don't share
+					// it with two futs at the same time 'cause we don't know how to handle that),
+					// so just panic here.
+					BodyMessage::Shell(_) => unreachable!(),
+					BodyMessage::Data(data) => partial_data.extend(data),
+					BodyMessage::Trailers(trailers) => partial_trailers.extend(trailers),
+					BodyMessage::Done(sender) => {
+						self.sender = Some(sender);
+						cache_partial_as_done = true;
+					}
+				}
+			};
+
+			if let Some(last_msg) = next_msg {
+				handle_msg(last_msg);
+			}
+
+			while let Ok(msg) = self.receiver.try_recv() {
+				handle_msg(msg);
+			}
+		}
+
+		if cache_partial_as_done {
+			// Don't like the take + unwrap, but I can't think of a way to 'upgrade' a ref mut (as
+			// we have above) into a take that returns the wrapped value, so we have to do this.
+			let (resp, data, trailers) = self.in_progress_resp.take().unwrap();
+			let (parts, NoOpBody) = resp.into_parts();
+			let body = CachedBody { data, trailers };
+
+			self.cache.remove(&key);
+			self.cache
+				.insert_if_not_exists(key.clone(), Response::from_parts(parts, body));
+		}
+
+		// If it's not valid so far, don't pass in the sender. We don't want them to have any
+		// mechanism to cache this response if it doesn't fulfill the prerequisites.
+		let valid_so_far = self
 			.options
 			.req_pred
 			.as_ref()
@@ -169,59 +250,72 @@ where
 			fut: self.inner.call(req),
 			cache: self.cache.clone(),
 			resp_pred: self.options.resp_pred.clone(),
-			fulfilled_req_pred,
+			sender: valid_so_far.then(|| self.sender.take()).flatten(),
 			_phantom: PhantomData
 		}
 	}
 }
 
 type CacheKey = (Method, Uri);
+type Resp<Body> = http::Response<MaybeCachedBody<Body>>;
+type CachedResp = http::Response<CachedBody>;
 
 pin_project! {
 	/// The [`Future`] returned by [`<CacheService as Service>::call`]
-	pub struct CachingFut<Cache, Err, Fut, Resp, RespPred>
+	pub struct CachingFut<Body, Cache, Err, Fut, RespPred>
 	where
-		Fut: Future<Output = Result<Resp, Err>>,
-		Resp: Clone,
-		Cache: cache::Cache<CacheKey, Resp>,
-		RespPred: Predicate<Resp>,
+		Fut: Future<Output = Result<http::Response<Body>, Err>>,
+		Cache: cache::Cache<CacheKey, CachedResp>,
+		RespPred: Predicate<Resp<Body>>,
 	{
 		key: CacheKey,
 		#[pin]
 		fut: Fut,
 		cache: Cache,
+		sender: Option<Sender<BodyMessage>>,
 		resp_pred: Option<Arc<RespPred>>,
-		fulfilled_req_pred: bool,
 		_phantom: PhantomData<Err>
 	}
 }
 
-impl<Cache, Err, Fut, Resp, RespPred> Future for CachingFut<Cache, Err, Fut, Resp, RespPred>
+impl<Body, Cache, Err, Fut, RespPred> Future for CachingFut<Body, Cache, Err, Fut, RespPred>
 where
-	Fut: Future<Output = Result<Resp, Err>>,
-	Resp: Clone,
-	Cache: cache::Cache<CacheKey, Resp>,
-	RespPred: Predicate<Resp>
+	Fut: Future<Output = Result<http::Response<Body>, Err>>,
+	Cache: cache::Cache<CacheKey, CachedResp>,
+	RespPred: Predicate<Resp<Body>>
 {
-	type Output = Fut::Output;
+	type Output = Result<Resp<Body>, Err>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		if let Some(resp) = self.cache.get(&self.key) {
-			return Poll::Ready(Ok((*resp).clone()));
+			let (parts, CachedBody { data, trailers }) = (*resp).clone().into_parts();
+			return Poll::Ready(Ok(Response::from_parts(parts, MaybeCachedBody::Cached {
+				data: Some(data),
+				trailers: Some(trailers)
+			})));
 		}
 
 		let proj = self.project();
 
-		let Poll::Ready(resp) = proj.fut.poll(cx) else {
-			return Poll::Pending;
-		};
+		match proj.fut.poll(cx) {
+			Poll::Ready(Ok(resp)) => {
+				let (parts, inner) = resp.into_parts();
+				if let Some(sender) = proj.sender {
+					sender.send(BodyMessage::Shell(Response::from_parts(
+						parts.clone(),
+						NoOpBody
+					)));
+				}
 
-		if let Ok(ref r) = resp {
-			if *proj.fulfilled_req_pred && proj.resp_pred.as_ref().is_none_or(|p| p.fulfills(r)) {
-				proj.cache.insert_if_not_exists(proj.key.clone(), r.clone());
+				let stream_body = CacheStreamBody {
+					inner,
+					sender: proj.sender.take()
+				};
+				let new_resp = Response::from_parts(parts, MaybeCachedBody::New(stream_body));
+				Poll::Ready(Ok(new_resp))
 			}
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending
 		}
-
-		Poll::Ready(resp)
 	}
 }
