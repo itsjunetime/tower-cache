@@ -172,20 +172,20 @@ impl<B: Body> Body for MaybeCachedBody<B> {
 	}
 }
 
-#[cfg(feature = "axum-core")]
-impl<B> axum_core::response::IntoResponse for MaybeCachedBody<B>
+#[cfg(feature = "axum")]
+impl<B> axum::response::IntoResponse for MaybeCachedBody<B>
 where
 	B: Body + Send + 'static,
 	B::Data: 'static,
 	<MaybeCachedBody<B> as Body>::Error: Send + Sync + core::error::Error + 'static,
 	<MaybeCachedBody<B> as Body>::Data: Send + 'static
 {
-	fn into_response(self) -> axum_core::response::Response {
-		axum_core::response::Response::new(axum_core::body::Body::from_stream(self))
+	fn into_response(self) -> axum::response::Response {
+		axum::response::Response::new(axum::body::Body::from_stream(self))
 	}
 }
 
-#[cfg(feature = "axum-core")]
+#[cfg(feature = "axum")]
 impl<B: Body> futures_core::stream::Stream for MaybeCachedBody<B>
 where
 	MaybeCachedBody<B>: Body,

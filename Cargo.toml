@@ -12,15 +12,15 @@ tower-service = "0.3.3"
 http = "1.1.0"
 dashmap = { version = "6.1.0", optional = true }
 pin-project-lite = "0.2.15"
-axum-core = { version = "0.4.5", optional = true }
+axum = { version = "0.7.9", optional = true }
 futures-core = { version = "0.3.31", optional = true }
 segvec = { version = "0.2.0", features = ["small-vec", "thin-segments"] }
 http-body = "1.0.1"
 bytes = "1.9.0"
 
 [features]
-default = ["axum-core"]
-axum-core = ["dep:axum-core", "dep:futures-core"]
+default = ["axum"]
+axum = ["dep:axum", "dep:futures-core"]
 
 [lints.rust]
 missing_docs = "warn"

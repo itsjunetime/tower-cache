@@ -68,6 +68,19 @@ where
 	_tys: PhantomData<(Req, Cache)>
 }
 
+impl<Body, Cache, RespPred, Req, ReqPred> Clone for CacheLayer<Body, Cache, RespPred, Req, ReqPred>
+where
+	RespPred: Predicate<Resp<Body>>,
+	ReqPred: Predicate<Req>
+{
+	fn clone(&self) -> Self {
+		Self {
+			options: self.options.clone(),
+			_tys: PhantomData
+		}
+	}
+}
+
 impl<Body, Cache, RespPred, Req, ReqPred> CacheLayer<Body, Cache, RespPred, Req, ReqPred>
 where
 	RespPred: Predicate<Resp<Body>>,
