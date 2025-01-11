@@ -317,6 +317,7 @@ dependencies = [
  "axum-core",
  "bytes",
  "dashmap",
+ "futures-core",
  "http",
  "http-body",
  "pin-project-lite",

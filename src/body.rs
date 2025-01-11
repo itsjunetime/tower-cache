@@ -108,6 +108,12 @@ impl<B: Buf> Buf for MaybeOwnedBuf<B> {
 	}
 }
 
+impl<B: Buf> AsRef<[u8]> for MaybeOwnedBuf<B> {
+	fn as_ref(&self) -> &[u8] {
+		self.chunk()
+	}
+}
+
 #[derive(Clone)]
 pub struct CachedBody {
 	pub(crate) data: VecDeque<u8>,
@@ -162,6 +168,63 @@ impl<B: Body> Body for MaybeCachedBody<B> {
 				Poll::Ready(None) => Poll::Ready(None),
 				Poll::Pending => Poll::Pending
 			}
+		}
+	}
+}
+
+#[cfg(feature = "axum-core")]
+impl<B> axum_core::response::IntoResponse for MaybeCachedBody<B>
+where
+	B: Body + Send + 'static,
+	B::Data: 'static,
+	<MaybeCachedBody<B> as Body>::Error: Send + Sync + core::error::Error,
+	<MaybeCachedBody<B> as Body>::Data: Send + 'static
+{
+	fn into_response(self) -> axum_core::response::Response {
+		axum_core::response::Response::new(axum_core::body::Body::from_stream(self))
+	}
+}
+
+#[cfg(feature = "axum-core")]
+impl<B: Body> futures_core::stream::Stream for MaybeCachedBody<B>
+where
+	MaybeCachedBody<B>: Body,
+	<MaybeCachedBody<B> as Body>::Data: Send + AsRef<[u8]> + 'static
+{
+	type Item = Result<bytes::Bytes, <MaybeCachedBody<B> as Body>::Error>;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		use bytes::Bytes;
+
+		match <Self as Body>::poll_frame(self, cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(None) => Poll::Ready(None),
+			Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+			Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(match frame.into_data() {
+				Ok(data) => Bytes::from_owner(data),
+				Err(frame) => frame
+					.into_trailers()
+					.map(|trailers| {
+						let mut trailers_str = Vec::new();
+						for (name, value) in trailers {
+							if let Some(name) = name {
+								if !trailers_str.is_empty() {
+									trailers_str.push(b'\n');
+								}
+
+								trailers_str.extend(name.as_str().as_bytes());
+								trailers_str.extend(b": ");
+							} else {
+								trailers_str.push(b',');
+							}
+
+							trailers_str.extend(value.as_bytes());
+						}
+
+						Bytes::from_owner(trailers_str)
+					})
+					.unwrap_or_default()
+			})))
 		}
 	}
 }
