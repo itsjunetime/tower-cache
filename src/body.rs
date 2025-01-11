@@ -177,7 +177,7 @@ impl<B> axum_core::response::IntoResponse for MaybeCachedBody<B>
 where
 	B: Body + Send + 'static,
 	B::Data: 'static,
-	<MaybeCachedBody<B> as Body>::Error: Send + Sync + core::error::Error,
+	<MaybeCachedBody<B> as Body>::Error: Send + Sync + core::error::Error + 'static,
 	<MaybeCachedBody<B> as Body>::Data: Send + 'static
 {
 	fn into_response(self) -> axum_core::response::Response {
@@ -189,7 +189,7 @@ where
 impl<B: Body> futures_core::stream::Stream for MaybeCachedBody<B>
 where
 	MaybeCachedBody<B>: Body,
-	<MaybeCachedBody<B> as Body>::Data: Send + AsRef<[u8]> + 'static
+	<MaybeCachedBody<B> as Body>::Data: Send + AsRef<[u8]>
 {
 	type Item = Result<bytes::Bytes, <MaybeCachedBody<B> as Body>::Error>;
 
@@ -201,7 +201,11 @@ where
 			Poll::Ready(None) => Poll::Ready(None),
 			Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
 			Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(match frame.into_data() {
-				Ok(data) => Bytes::from_owner(data),
+				// Unfortunately, we do have to do this 'copy_from_slice' because, even though we
+				// know `data` is `MaybeOwnedBuf<B::Data>`, we don't know if `B::Data` is 'static
+				// or not, and also VecDeque that it might contain (if it's already owned) is not
+				// necessarily contiguous in memory, so we need to copy it over anyways.
+				Ok(data) => Bytes::copy_from_slice(data.as_ref()),
 				Err(frame) => frame
 					.into_trailers()
 					.map(|trailers| {

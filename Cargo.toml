@@ -19,6 +19,7 @@ http-body = "1.0.1"
 bytes = "1.9.0"
 
 [features]
+default = ["axum-core"]
 axum-core = ["dep:axum-core", "dep:futures-core"]
 
 [lints.rust]
