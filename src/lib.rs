@@ -133,6 +133,23 @@ where
 	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>
 }
 
+impl<Body, Cache, RespPred, Req, ReqPred, Svc> Clone
+	for CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>
+where
+	RespPred: Predicate<Resp<Body>>,
+	ReqPred: Predicate<Req>,
+	Svc: Service<Req> + Clone,
+	Cache: Clone
+{
+	fn clone(&self) -> Self {
+		Self {
+			inner: self.inner.clone(),
+			cache: self.cache.clone(),
+			options: self.options.clone()
+		}
+	}
+}
+
 impl<Body, Cache, RespPred, Req, ReqPred, Svc> Service<Request<Req>>
 	for CacheService<Body, Cache, RespPred, Request<Req>, ReqPred, Svc>
 where
