@@ -71,6 +71,8 @@ where
 		}
 	}
 
+	/// Get the invalidator currently stored in this instance to be used later for manual
+	/// invalidation
 	pub fn invalidator(&self) -> Invalidator {
 		self.invalidator.clone()
 	}

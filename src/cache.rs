@@ -1,15 +1,18 @@
 //! Basic traits and implementations of [`self::Cache`] for usage with each handler
 
 use std::{
-	ops::Deref,
-	sync::{Arc, MappedRwLockReadGuard, PoisonError, RwLock, RwLockReadGuard}
+	ops::{Deref, DerefMut},
+	sync::{
+		Arc, MappedRwLockReadGuard, MappedRwLockWriteGuard, PoisonError, RwLock, RwLockReadGuard,
+		RwLockWriteGuard
+	}
 };
 
 /// A basic cache trait, with only the necessary methods and types to make our service work.
 pub trait Cache<K, V>: Default + Clone + Send + 'static {
-	/// Because [`Self`] must be [`Send`] (to share the cache across futures and process requests
-	/// and responses), we generally need a type that represents a borrowed guard that generally
-	/// will 'unlock' self when it's dropped (e.g. [`RwLockReadGuard`])
+	/// Because Self must be [`Send`] (to share the cache across futures and process requests and
+	/// responses), we generally need a type that represents a borrowed guard that generally will
+	/// 'unlock' self when it's dropped (e.g. [`RwLockReadGuard`])
 	type GetGuard<'guard>: Deref<Target = V>
 	where
 		V: 'guard;
@@ -18,6 +21,18 @@ pub trait Cache<K, V>: Default + Clone + Send + 'static {
 	/// Callers should assume that `self` is locked until the return value is dropped (if it is
 	/// [`Some`]), as that's how most [`Send`]-implementing map/caches work.
 	fn get<'s>(&'s self, key: &K) -> Option<Self::GetGuard<'s>>;
+
+	/// The guard type which wraps a mutable reference to a value in the cache, akin to
+	/// [`RwLockWriteGuard`]. Returned from [`get_mut`]
+	///
+	/// [`get_mut`]: Cache::get_mut
+	type GetMutGuard<'guard>: DerefMut<Target = V>
+	where
+		V: 'guard;
+
+	/// Potentially get a mutable reference to entry in the cache. This will return [`None`] if
+	/// such an entry doesn't exist, but will return the guard if it does exist.
+	fn get_mut<'s>(&'s mut self, key: &K) -> Option<Self::GetMutGuard<'s>>;
 
 	/// Insert the value `val` for key `key` in the cache.
 	fn insert_if_not_exists(&mut self, key: K, val: V);
@@ -60,6 +75,19 @@ where
 		.ok()
 	}
 
+	type GetMutGuard<'guard>
+		= MappedRwLockWriteGuard<'guard, V>
+	where
+		V: 'guard;
+
+	fn get_mut<'s>(&'s mut self, key: &K) -> Option<Self::GetMutGuard<'s>> {
+		RwLockWriteGuard::try_map(
+			self.0.write().unwrap_or_else(PoisonError::into_inner),
+			|cache| cache.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+		)
+		.ok()
+	}
+
 	fn insert_if_not_exists(&mut self, key: K, val: V) {
 		let mut cache = self.0.write().unwrap_or_else(PoisonError::into_inner);
 		if !cache.iter().any(|(k, _)| key == *k) {
@@ -89,7 +117,16 @@ where
 		V: 'guard;
 
 	fn get<'s>(&'s self, key: &K) -> Option<Self::GetGuard<'s>> {
-		self.get(key)
+		dashmap::DashMap::get(self, key)
+	}
+
+	type GetMutGuard<'guard>
+		= dashmap::mapref::one::RefMut<'guard, K, V>
+	where
+		V: 'guard;
+
+	fn get_mut<'s>(&'s mut self, key: &K) -> Option<Self::GetMutGuard<'s>> {
+		dashmap::DashMap::get_mut(self, key)
 	}
 
 	fn insert_if_not_exists(&mut self, key: K, val: V) {

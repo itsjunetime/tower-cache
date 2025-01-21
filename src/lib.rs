@@ -10,13 +10,10 @@ use core::{
 };
 use std::{
 	collections::VecDeque,
-	sync::{
-		mpsc::{channel, Receiver, Sender, TryRecvError},
-		Arc
-	}
+	sync::{atomic::AtomicU32, Arc, PoisonError, RwLock}
 };
 
-use body::{BodyMessage, CacheStreamBody, CachedBody, MaybeCachedBody, NoOpBody};
+use body::{CacheStreamBody, CachedBody, MaybeCachedBody, NoOpBody};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use options::{CacheOptions, Predicate};
 use pin_project_lite::pin_project;
@@ -106,14 +103,9 @@ where
 	type Service = CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>;
 
 	fn layer(&self, inner: Svc) -> Self::Service {
-		let (sender, receiver) = channel();
 		CacheService {
 			inner,
 			cache: Cache::default(),
-			registered_with_invalidator: Vec::new(),
-			sender: Some(sender),
-			receiver,
-			in_progress_resp: None,
 			options: self.options.clone()
 		}
 	}
@@ -138,10 +130,6 @@ where
 {
 	inner: Svc,
 	cache: Cache,
-	registered_with_invalidator: Vec<(CacheKey, Arc<AtomicBool>)>,
-	sender: Option<Sender<BodyMessage>>,
-	receiver: Receiver<BodyMessage>,
-	in_progress_resp: Option<(http::Response<NoOpBody>, VecDeque<u8>, HeaderMap)>,
 	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>
 }
 
@@ -158,7 +146,7 @@ where
 {
 	type Response = Resp<Body>;
 	type Error = Svc::Error;
-	type Future = CachingFut<Body, Cache, Svc::Error, Svc::Future, RespPred>;
+	type Future = CachingFut<Body, Svc::Error, Svc::Future, RespPred>;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		self.inner.poll_ready(cx)
@@ -171,84 +159,40 @@ where
 		// handler. To do that, we need to check if we've already handled a request wth this key.
 		// 'Cause if we haven't handled a request with this key, there's nothing to invalidate
 		// anyways.
-		let invalidated = self
-			.registered_with_invalidator
-			.iter()
-			.find(|(k, _)| *k == key)
-			.map(|(_, valid)| valid);
+		let entry = {
+			let invalidated = self.cache.get_mut(&key);
 
-		// So. If we did get the bool that indicates whether it's been invaidated or not, we want
-		// to check if and remove the cached response if it's been invalidated.
-		match invalidated {
-			Some(valid) =>
-				if !valid.load(Ordering::Relaxed) {
-					self.cache.remove(&key);
-					valid.store(true, Ordering::Relaxed);
-				},
-			// If we haven't yet received a request with this key, though, we need to indicate that
-			// we now have so it can be invalidated in the future.
-			None => {
-				let valid = self.options.invalidator.insert(key.clone());
-				self.registered_with_invalidator.push((key.clone(), valid));
-			}
-		}
-
-		let next_msg = match self.receiver.try_recv() {
-			Ok(msg) => match msg {
-				BodyMessage::Shell(shell) => {
-					self.in_progress_resp =
-						Some((shell, VecDeque::default(), HeaderMap::default()));
-					None
+			// So. If we did get the bool that indicates whether it's been invaidated or not, we want
+			// to check if and remove the cached response if it's been invalidated.
+			match invalidated {
+				Some(guard) => {
+					let mut response = (**guard).write().unwrap_or_else(PoisonError::into_inner);
+					if !response.valid.load(Ordering::Relaxed) {
+						response.response = MaybeCompleteResponse::Nothing;
+						response.valid.store(true, Ordering::Relaxed);
+					}
+					guard.clone()
 				}
-				msg => Some(msg)
-			},
-			Err(TryRecvError::Empty) => None,
-			// This shouldn't happen ever. There should always either be a Sender in this struct,
-			// in a Fut, or within the channel (being sent back to this struct)
-			Err(TryRecvError::Disconnected) => unreachable!()
+				// If we haven't yet received a request with this key, though, we need to indicate that
+				// we now have so it can be invalidated in the future.
+				None => {
+					drop(invalidated);
+					let valid = self.options.invalidator.insert(key.clone());
+					let entry = Arc::new(RwLock::new(CachedRespInner::new(valid)));
+					self.cache.insert_if_not_exists(key.clone(), entry.clone());
+					entry
+				}
+			}
 		};
 
-		let mut cache_partial_as_done = false;
-		if let Some((_, ref mut partial_data, ref mut partial_trailers)) =
-			self.in_progress_resp.as_mut()
-		{
-			let mut handle_msg = |msg: BodyMessage| {
-				match msg {
-					// If we handle a Shell here, that's a bug - we either didn't handle it up
-					// above as we should've, or we loaned a sender out to two futs at the same
-					// time and they're sending us response data at the same time (we don't share
-					// it with two futs at the same time 'cause we don't know how to handle that),
-					// so just panic here.
-					BodyMessage::Shell(_) => unreachable!(),
-					BodyMessage::Data(data) => partial_data.extend(data),
-					BodyMessage::Trailers(trailers) => partial_trailers.extend(trailers),
-					BodyMessage::Done(sender) => {
-						self.sender = Some(sender);
-						cache_partial_as_done = true;
-					}
-				}
-			};
+		// Then, after we've checked to see if it's invalidated (and cleared the cache if so), we
+		// need to see if we have since computed a new response. Technically this is a race
+		// condition, as we can't know exactly what happened first - if we computed this response
+		// or if we told ourselves to invalidate it first. We err on the side of recomputing a new
+		// response.
 
-			if let Some(last_msg) = next_msg {
-				handle_msg(last_msg);
-			}
-
-			while let Ok(msg) = self.receiver.try_recv() {
-				handle_msg(msg);
-			}
-		}
-
-		if cache_partial_as_done {
-			// Don't like the take + unwrap, but I can't think of a way to 'upgrade' a ref mut (as
-			// we have above) into a take that returns the wrapped value, so we have to do this.
-			let (resp, data, trailers) = self.in_progress_resp.take().unwrap();
-			let (parts, NoOpBody) = resp.into_parts();
-			let body = CachedBody { data, trailers };
-
-			self.cache.remove(&key);
-			self.cache
-				.insert_if_not_exists(key.clone(), Response::from_parts(parts, body));
-		}
+		// if it's been invalidated, just clear the receiver so that there aren't messages sitting
+		// in there that will never be read
 
 		// If it's not valid so far, don't pass in the sender. We don't want them to have any
 		// mechanism to cache this response if it doesn't fulfill the prerequisites.
@@ -259,11 +203,10 @@ where
 			.is_none_or(|p| p.fulfills(&req));
 
 		CachingFut {
-			key,
 			fut: self.inner.call(req),
-			cache: self.cache.clone(),
+			entry,
 			resp_pred: self.options.resp_pred.clone(),
-			sender: valid_so_far.then(|| self.sender.take()).flatten(),
+			valid_so_far,
 			_phantom: PhantomData
 		}
 	}
@@ -271,41 +214,76 @@ where
 
 type CacheKey = (Method, Uri);
 type Resp<Body> = http::Response<MaybeCachedBody<Body>>;
-type CachedResp = http::Response<CachedBody>;
+
+type CachedResp = Arc<RwLock<CachedRespInner>>;
+
+struct CachedRespInner {
+	valid: Arc<AtomicBool>,
+	response: MaybeCompleteResponse
+}
+
+enum MaybeCompleteResponse {
+	Nothing,
+	Partial(PartialResponse),
+	Complete(http::Response<CachedBody>)
+}
+
+struct PartialResponse {
+	resp: http::Response<NoOpBody>,
+	data: VecDeque<u8>,
+	trailers: HeaderMap,
+	cond_var: Arc<AtomicU32>
+}
+
+impl CachedRespInner {
+	fn new(valid: Arc<AtomicBool>) -> Self {
+		Self {
+			valid,
+			response: MaybeCompleteResponse::Nothing
+		}
+	}
+}
 
 pin_project! {
 	/// The [`Future`] returned by [`<CacheService as Service>::call`]
-	pub struct CachingFut<Body, Cache, Err, Fut, RespPred>
+	pub struct CachingFut<Body, Err, Fut, RespPred>
 	where
 		Fut: Future<Output = Result<http::Response<Body>, Err>>,
-		Cache: cache::Cache<CacheKey, CachedResp>,
 		RespPred: Predicate<Resp<Body>>,
 	{
-		key: CacheKey,
 		#[pin]
 		fut: Fut,
-		cache: Cache,
-		sender: Option<Sender<BodyMessage>>,
+		entry: CachedResp,
+		valid_so_far: bool,
 		resp_pred: Option<Arc<RespPred>>,
 		_phantom: PhantomData<Err>
 	}
 }
 
-impl<Body, Cache, Err, Fut, RespPred> Future for CachingFut<Body, Cache, Err, Fut, RespPred>
+impl<Body, Err, Fut, RespPred> Future for CachingFut<Body, Err, Fut, RespPred>
 where
 	Fut: Future<Output = Result<http::Response<Body>, Err>>,
-	Cache: cache::Cache<CacheKey, CachedResp>,
 	RespPred: Predicate<Resp<Body>>
 {
 	type Output = Result<Resp<Body>, Err>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		if let Some(resp) = self.cache.get(&self.key) {
-			let (parts, CachedBody { data, trailers }) = (*resp).clone().into_parts();
-			return Poll::Ready(Ok(Response::from_parts(parts, MaybeCachedBody::Cached {
+		fn clone_cached<B, E>(
+			resp: &Response<CachedBody>
+		) -> Poll<Result<Response<MaybeCachedBody<B>>, E>> {
+			let (parts, CachedBody { data, trailers }) = resp.clone().into_parts();
+			Poll::Ready(Ok(Response::from_parts(parts, MaybeCachedBody::Cached {
 				data: Some(data),
 				trailers: Some(trailers)
-			})));
+			})))
+		}
+
+		{
+			let maybe_complete = self.entry.read().unwrap_or_else(PoisonError::into_inner);
+			if let MaybeCompleteResponse::Complete(ref resp) = maybe_complete.response {
+				// If we have a response, then just clone it and return it. Woohoo!
+				return clone_cached(resp);
+			}
 		}
 
 		let proj = self.project();
@@ -313,19 +291,46 @@ where
 		match proj.fut.poll(cx) {
 			Poll::Ready(Ok(resp)) => {
 				let (parts, inner) = resp.into_parts();
-				if let Some(sender) = proj.sender {
-					sender.send(BodyMessage::Shell(Response::from_parts(
-						parts.clone(),
-						NoOpBody
-					)));
-				}
 
-				let stream_body = CacheStreamBody {
-					inner,
-					sender: proj.sender.take()
-				};
-				let new_resp = Response::from_parts(parts, MaybeCachedBody::New(stream_body));
-				Poll::Ready(Ok(new_resp))
+				// We're looping through this so that if we see that there's already a partial
+				// response that someone else is working on, we just wait for that to be ready and
+				// once we see that it is ready (or at least wee see that the flag has changed, so
+				// we should check again)
+				loop {
+					// This is safe to unwrap 'cause we verify that up above
+					let mut resp = proj.entry.write().unwrap_or_else(PoisonError::into_inner);
+					match resp.response {
+						// If there's still nothing in the response, then just continue with the
+						// streaming body and such.
+						MaybeCompleteResponse::Nothing => {
+							resp.response = MaybeCompleteResponse::Partial(PartialResponse {
+								resp: Response::from_parts(parts.clone(), NoOpBody),
+								data: VecDeque::new(),
+								trailers: HeaderMap::new(),
+								cond_var: Arc::new(AtomicU32::new(0))
+							});
+
+							drop(resp);
+
+							let stream_body = CacheStreamBody {
+								inner,
+								cache_entry: proj.entry.clone()
+							};
+							let new_resp =
+								Response::from_parts(parts, MaybeCachedBody::New(stream_body));
+							return Poll::Ready(Ok(new_resp));
+						}
+						MaybeCompleteResponse::Partial(PartialResponse {
+							ref cond_var, ..
+						}) => {
+							let var = cond_var.clone();
+							drop(resp);
+
+							atomic_wait::wait(&var, 0);
+						}
+						MaybeCompleteResponse::Complete(ref resp) => return clone_cached(resp)
+					}
+				}
 			}
 			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
 			Poll::Pending => Poll::Pending

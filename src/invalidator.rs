@@ -7,6 +7,10 @@ use segvec::SegVec;
 
 use crate::CacheKey;
 
+/// A struct which can be used to manually invalidate responses from the Cache produced by
+/// [`CacheService`]. If the `axum` feature is enabled, this can be used as an [`
+///
+/// [`CacheService`]: crate::CacheService
 #[derive(Default, Clone)]
 pub struct Invalidator {
 	valids: Arc<RwLock<SegVec<KeyIsValid>>>
@@ -28,15 +32,26 @@ impl Invalidator {
 		valid
 	}
 
+	/// Invalidate every response associated with the given [`CacheKey`]
 	pub fn invalidate(&self, key: &CacheKey) {
 		self.invalidate_all_with_pred(|k| k == key)
 	}
 
+	/// Invalidate every response which was sent as a response for the given path. Note that this
+	/// (at time of writing) matches exactly - this only invalidates responses which were given for
+	/// this *exact* path. If you want to match *roughly*, you would currently be better off using
+	/// [`invalidate_all_with_pred`]
+	///
+	/// [`invalidate_all_with_pred`]: Invalidator::invalidate_all_with_pred
 	pub fn invalidate_all_for(&self, path: &http::Uri) {
 		// [TODO] check if it just contains it instead of matches exactly
 		self.invalidate_all_with_pred(|key| key.1 == *path);
 	}
 
+	/// Invalidate responses based on a provided predicate which processes a [`CacheKey`] and
+	/// returns a bool
+	///
+	/// [`CacheKey`]: crate::CacheKey
 	pub fn invalidate_all_with_pred(&self, pred: impl Fn(&CacheKey) -> bool) {
 		let valids = self.valids.read().unwrap_or_else(PoisonError::into_inner);
 		for (_, entry) in valids.iter().filter(|(k, _)| pred(k)) {
@@ -45,10 +60,10 @@ impl Invalidator {
 	}
 }
 
-#[cfg(feature = "axum-core")]
-impl<T> axum_core::extract::FromRequestParts<T> for Invalidator
+#[cfg(feature = "axum")]
+impl<T> axum::extract::FromRequestParts<T> for Invalidator
 where
-	Invalidator: axum_core::extract::FromRef<T>
+	Invalidator: axum::extract::FromRef<T>
 {
 	type Rejection = core::convert::Infallible;
 
@@ -63,7 +78,7 @@ where
 		'life0: 'async_trait,
 		'life1: 'async_trait
 	{
-		let new = <Invalidator as axum_core::extract::FromRef<T>>::from_ref(state);
+		let new = <Invalidator as axum::extract::FromRef<T>>::from_ref(state);
 		Box::pin(async move { Ok(new) })
 	}
 }

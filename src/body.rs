@@ -1,20 +1,28 @@
+//! A collection of implementors of [`http_body::Body`] which enable streamed caching in this crate
+
 use std::{
 	collections::VecDeque,
 	convert::Infallible,
 	pin::Pin,
-	sync::mpsc::Sender,
+	sync::{atomic::Ordering, PoisonError},
 	task::{Context, Poll}
 };
 
 use bytes::Buf;
-use http::HeaderMap;
+use http::{HeaderMap, Response};
 use http_body::{Body, Frame};
 
+use crate::{CachedResp, CachedRespInner, MaybeCompleteResponse, PartialResponse};
+
 pin_project_lite::pin_project! {
-	pub struct CacheStreamBody<B> {
+	/// A struct wrapping an implementor of [`Body`] which copies all data and trailers returned
+	/// from the wrapped Body so that it can be cached and returned easily at a later date
+	///
+	/// [`Body`]: http_body::Body
+	pub struct CacheStreamBody<Body> {
 		#[pin]
-		pub inner: B,
-		pub sender: Option<Sender<BodyMessage>>
+		pub(crate) inner: Body,
+		pub(crate) cache_entry: CachedResp
 	}
 }
 
@@ -26,62 +34,104 @@ impl<B: Body> Body for CacheStreamBody<B> {
 		self: Pin<&mut Self>,
 		cx: &mut Context<'_>
 	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-		// If any of the `.send()` calls fail in this function, just let them fail. They only fail
-		// if there's no receiving end, and if that's the case, there's nothing to cache our data
-		// and nobody who would even be able to serve our cached data so it's fine to just let it
-		// disappear.
-
 		let proj = self.project();
 		match proj.inner.poll_frame(cx) {
-			Poll::Ready(None) => {
-				if let Some(ref sender) = proj.sender {
-					drop(sender.send(BodyMessage::Done(sender.clone())));
-				}
-				Poll::Ready(None)
-			}
-			Poll::Ready(Some(Ok(mut frame))) => {
-				if let Some(ref sender) = proj.sender {
-					frame = match frame.into_data() {
-						Ok(mut data) => {
-							let mut vec = VecDeque::with_capacity(data.remaining());
-							while data.remaining() > 0 {
-								let chunk = data.chunk();
-								vec.extend(chunk);
-								data.advance(chunk.len());
-							}
+			Poll::Ready(frame_res_opt) => {
+				let mut inner = proj
+					.cache_entry
+					.write()
+					.unwrap_or_else(PoisonError::into_inner);
 
-							drop(sender.send(BodyMessage::Data(vec.clone())));
-							return Poll::Ready(Some(Ok(Frame::data(MaybeOwnedBuf::Owned(vec)))));
-						}
-						Err(frame) => {
-							if let Some(trailers) = frame.trailers_ref() {
-								drop(sender.send(BodyMessage::Trailers(trailers.clone())));
+				let CachedRespInner {
+					response: MaybeCompleteResponse::Partial(ref mut resp),
+					valid: _
+				} = *inner
+				else {
+					panic!()
+				};
+
+				match frame_res_opt {
+					Some(Err(e)) => {
+						// If we run into an error, we still need to tell the cond_var that we're
+						// done and reset the cache so that someone else can try to get the
+						// response.
+						let cond_var = resp.cond_var.clone();
+
+						inner.response = MaybeCompleteResponse::Nothing;
+						drop(inner);
+
+						cond_var.store(1, Ordering::Release);
+
+						Poll::Ready(Some(Err(e)))
+					}
+					None => {
+						let PartialResponse {
+							resp,
+							data,
+							trailers,
+							cond_var
+						} = resp;
+						let (parts, NoOpBody) = std::mem::take(resp).into_parts();
+
+						let data = std::mem::take(data);
+						let trailers = std::mem::take(trailers);
+						let cond_var = cond_var.clone();
+
+						inner.response = MaybeCompleteResponse::Complete(Response::from_parts(
+							parts,
+							CachedBody { data, trailers }
+						));
+						drop(inner);
+
+						cond_var.store(1, Ordering::Release);
+
+						Poll::Ready(None)
+					}
+					Some(Ok(mut frame)) => {
+						frame = match frame.into_data() {
+							Ok(mut data) => {
+								let mut vec = VecDeque::with_capacity(data.remaining());
+								while data.remaining() > 0 {
+									let chunk = data.chunk();
+									vec.extend(chunk);
+									data.advance(chunk.len());
+								}
+
+								resp.data.extend(vec.iter());
+								return Poll::Ready(Some(Ok(Frame::data(MaybeOwnedBuf::Owned(
+									vec
+								)))));
 							}
-							frame
-						}
+							Err(frame) => {
+								if let Some(trailers) = frame.trailers_ref() {
+									resp.trailers.extend(trailers.clone());
+								}
+								frame
+							}
+						};
+
+						Poll::Ready(Some(Ok(match frame.into_data() {
+							Ok(data) => Frame::data(MaybeOwnedBuf::MaybeUnowned(data)),
+							Err(frame) => Frame::trailers(frame.into_trailers().ok().unwrap())
+						})))
 					}
 				}
-
-				Poll::Ready(Some(Ok(match frame.into_data() {
-					Ok(data) => Frame::data(MaybeOwnedBuf::MaybeUnowned(data)),
-					Err(frame) => Frame::trailers(frame.into_trailers().ok().unwrap())
-				})))
 			}
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e)))
+			Poll::Pending => Poll::Pending
 		}
 	}
 }
 
-pub(crate) enum BodyMessage {
-	Shell(http::Response<NoOpBody>),
-	Data(VecDeque<u8>),
-	Trailers(HeaderMap),
-	Done(Sender<Self>)
-}
-
+/// a [`Buf`] implementor that may own the data it wraps and may not. Essentially a [`Cow`] but for
+/// [`Buf`] implementors
+///
+/// [`Buf`]: bytes::buf::Buf
+/// [`Cow`]: std::borrow::Cow
 pub enum MaybeOwnedBuf<B: Buf> {
+	/// A variant where we know we own all the relevant data
 	Owned(VecDeque<u8>),
+	/// A variant where we don't know the type that we're wrapping - it may 'own' its data, or it
+	/// may be borrowing.
 	MaybeUnowned(B)
 }
 
@@ -115,16 +165,31 @@ impl<B: Buf> AsRef<[u8]> for MaybeOwnedBuf<B> {
 }
 
 #[derive(Clone)]
-pub struct CachedBody {
+pub(crate) struct CachedBody {
 	pub(crate) data: VecDeque<u8>,
 	pub(crate) trailers: HeaderMap
 }
 
+/// An implementor of [`Body`] that may already be cached (and thus can just be cloned
+/// and returned) or may need to be polled and streamed through the general `Body` interface
+///
+/// [`Body`]: http_body::Body
 pub enum MaybeCachedBody<B> {
+	/// The variant present if this body has already been cached and we just need to return it
 	Cached {
+		/// The data of the body - an [`Option`] so that we can just take it out and leave [`None`]
+		/// in its place after we've already returned it from [`poll_frame`]
+		///
+		/// [`poll_frame`]: http_body::Body::poll_frame
 		data: Option<VecDeque<u8>>,
+		/// The trailers of the body, once again wrapped in an option so we can just [`take`] it
+		/// out when we want to return it
+		///
+		/// [`take`]: std::mem::take
 		trailers: Option<HeaderMap>
 	},
+	/// The variant present if the body has not been cached yet and we need to poll, process, and
+	/// cache it.
 	New(CacheStreamBody<B>)
 }
 
@@ -177,8 +242,8 @@ impl<B> axum::response::IntoResponse for MaybeCachedBody<B>
 where
 	B: Body + Send + 'static,
 	B::Data: 'static,
-	<MaybeCachedBody<B> as Body>::Error: Send + Sync + core::error::Error + 'static,
-	<MaybeCachedBody<B> as Body>::Data: Send + 'static
+	<Self as Body>::Error: Send + Sync + core::error::Error + 'static,
+	<Self as Body>::Data: Send + 'static
 {
 	fn into_response(self) -> axum::response::Response {
 		axum::response::Response::new(axum::body::Body::from_stream(self))
@@ -188,10 +253,10 @@ where
 #[cfg(feature = "axum")]
 impl<B: Body> futures_core::stream::Stream for MaybeCachedBody<B>
 where
-	MaybeCachedBody<B>: Body,
-	<MaybeCachedBody<B> as Body>::Data: Send + AsRef<[u8]>
+	Self: Body,
+	<Self as Body>::Data: Send + AsRef<[u8]>
 {
-	type Item = Result<bytes::Bytes, <MaybeCachedBody<B> as Body>::Error>;
+	type Item = Result<bytes::Bytes, <Self as Body>::Error>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		use bytes::Bytes;
@@ -233,6 +298,8 @@ where
 	}
 }
 
+/// A [`http_body::Body`] that contains no data and is always ready to return `None` when polled
+#[derive(Default)]
 pub struct NoOpBody;
 
 impl Body for NoOpBody {
