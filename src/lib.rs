@@ -8,12 +8,10 @@ use core::{
 	sync::atomic::{AtomicBool, Ordering},
 	task::{Context, Poll}
 };
-use std::{
-	collections::VecDeque,
-	sync::{atomic::AtomicU32, Arc, PoisonError, RwLock}
-};
+use std::sync::{atomic::AtomicU32, Arc, PoisonError, RwLock};
 
 use body::{CacheStreamBody, CachedBody, MaybeCachedBody, NoOpBody};
+use bytes::BytesMut;
 use http::{HeaderMap, Method, Request, Response, Uri};
 use options::{CacheOptions, Predicate};
 use pin_project_lite::pin_project;
@@ -162,6 +160,7 @@ where
 	ReqPred: Predicate<Request<Req>>
 {
 	type Response = Resp<Body>;
+
 	type Error = Svc::Error;
 	type Future = CachingFut<Body, Svc::Error, Svc::Future, RespPred>;
 
@@ -239,6 +238,9 @@ struct CachedRespInner {
 	response: MaybeCompleteResponse
 }
 
+/// I would like to work around this but boxing stuff makes types in trait implementations
+/// difficult... hmmmmmm
+#[expect(clippy::large_enum_variant)]
 enum MaybeCompleteResponse {
 	Nothing,
 	Partial(PartialResponse),
@@ -247,7 +249,7 @@ enum MaybeCompleteResponse {
 
 struct PartialResponse {
 	resp: http::Response<NoOpBody>,
-	data: VecDeque<u8>,
+	data: BytesMut,
 	trailers: HeaderMap,
 	cond_var: Arc<AtomicU32>
 }
@@ -322,7 +324,7 @@ where
 						MaybeCompleteResponse::Nothing => {
 							resp.response = MaybeCompleteResponse::Partial(PartialResponse {
 								resp: Response::from_parts(parts.clone(), NoOpBody),
-								data: VecDeque::new(),
+								data: BytesMut::new(),
 								trailers: HeaderMap::new(),
 								cond_var: Arc::new(AtomicU32::new(0))
 							});

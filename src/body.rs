@@ -8,7 +8,7 @@ use std::{
 	task::{Context, Poll}
 };
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use http::{HeaderMap, Response};
 use http_body::{Body, Frame};
 
@@ -27,7 +27,7 @@ pin_project_lite::pin_project! {
 }
 
 impl<B: Body> Body for CacheStreamBody<B> {
-	type Data = MaybeOwnedBuf<B::Data>;
+	type Data = Bytes;
 	type Error = B::Error;
 
 	fn poll_frame(
@@ -73,7 +73,7 @@ impl<B: Body> Body for CacheStreamBody<B> {
 						} = resp;
 						let (parts, NoOpBody) = std::mem::take(resp).into_parts();
 
-						let data = std::mem::take(data);
+						let data = std::mem::take(data).into();
 						let trailers = std::mem::take(trailers);
 						let cond_var = cond_var.clone();
 
@@ -90,7 +90,7 @@ impl<B: Body> Body for CacheStreamBody<B> {
 					Some(Ok(mut frame)) => {
 						frame = match frame.into_data() {
 							Ok(mut data) => {
-								let mut vec = VecDeque::with_capacity(data.remaining());
+								let mut vec = Vec::with_capacity(data.remaining());
 								while data.remaining() > 0 {
 									let chunk = data.chunk();
 									vec.extend(chunk);
@@ -98,7 +98,7 @@ impl<B: Body> Body for CacheStreamBody<B> {
 								}
 
 								resp.data.extend(vec.iter());
-								return Poll::Ready(Some(Ok(Frame::data(MaybeOwnedBuf::Owned(
+								return Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(
 									vec
 								)))));
 							}
@@ -111,7 +111,10 @@ impl<B: Body> Body for CacheStreamBody<B> {
 						};
 
 						Poll::Ready(Some(Ok(match frame.into_data() {
-							Ok(data) => Frame::data(MaybeOwnedBuf::MaybeUnowned(data)),
+							// we don't like copying data but since we're using built-in
+							// overrideable Buf methods, if someone wants to ensure we don't have
+							// to do copies, they can do so.
+							Ok(mut data) => Frame::data(data.copy_to_bytes(data.remaining())),
 							Err(frame) => Frame::trailers(frame.into_trailers().ok().unwrap())
 						})))
 					}
@@ -122,51 +125,9 @@ impl<B: Body> Body for CacheStreamBody<B> {
 	}
 }
 
-/// a [`Buf`] implementor that may own the data it wraps and may not. Essentially a [`Cow`] but for
-/// [`Buf`] implementors
-///
-/// [`Buf`]: bytes::buf::Buf
-/// [`Cow`]: std::borrow::Cow
-pub enum MaybeOwnedBuf<B: Buf> {
-	/// A variant where we know we own all the relevant data
-	Owned(VecDeque<u8>),
-	/// A variant where we don't know the type that we're wrapping - it may 'own' its data, or it
-	/// may be borrowing.
-	MaybeUnowned(B)
-}
-
-impl<B: Buf> Buf for MaybeOwnedBuf<B> {
-	fn remaining(&self) -> usize {
-		match self {
-			Self::Owned(v) => v.remaining(),
-			Self::MaybeUnowned(b) => b.remaining()
-		}
-	}
-
-	fn chunk(&self) -> &[u8] {
-		match self {
-			Self::Owned(v) => v.chunk(),
-			Self::MaybeUnowned(b) => b.chunk()
-		}
-	}
-
-	fn advance(&mut self, cnt: usize) {
-		match self {
-			Self::Owned(v) => v.advance(cnt),
-			Self::MaybeUnowned(b) => b.advance(cnt)
-		}
-	}
-}
-
-impl<B: Buf> AsRef<[u8]> for MaybeOwnedBuf<B> {
-	fn as_ref(&self) -> &[u8] {
-		self.chunk()
-	}
-}
-
 #[derive(Clone)]
 pub(crate) struct CachedBody {
-	pub(crate) data: VecDeque<u8>,
+	pub(crate) data: Bytes,
 	pub(crate) trailers: HeaderMap
 }
 
@@ -181,7 +142,7 @@ pub enum MaybeCachedBody<B> {
 		/// in its place after we've already returned it from [`poll_frame`]
 		///
 		/// [`poll_frame`]: http_body::Body::poll_frame
-		data: Option<VecDeque<u8>>,
+		data: Option<Bytes>,
 		/// The trailers of the body, once again wrapped in an option so we can just [`take`] it
 		/// out when we want to return it
 		///
@@ -194,7 +155,7 @@ pub enum MaybeCachedBody<B> {
 }
 
 impl<B: Body> Body for MaybeCachedBody<B> {
-	type Data = MaybeOwnedBuf<B::Data>;
+	type Data = Bytes;
 	type Error = B::Error;
 
 	fn poll_frame(
@@ -206,7 +167,7 @@ impl<B: Body> Body for MaybeCachedBody<B> {
 		match unsafe { Pin::get_unchecked_mut(self) } {
 			Self::Cached { data, trailers } => {
 				if let Some(data) = data.take() {
-					return Poll::Ready(Some(Ok(Frame::data(MaybeOwnedBuf::Owned(data)))));
+					return Poll::Ready(Some(Ok(Frame::data(data))));
 				}
 
 				if let Some(trailers) = trailers.take() {
@@ -237,7 +198,7 @@ impl<B: Body> Body for MaybeCachedBody<B> {
 	}
 }
 
-#[cfg(feature = "axum")]
+/*#[cfg(feature = "axum")]
 impl<B> axum::response::IntoResponse for MaybeCachedBody<B>
 where
 	B: Body + Send + 'static,
@@ -259,18 +220,12 @@ where
 	type Item = Result<bytes::Bytes, <Self as Body>::Error>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		use bytes::Bytes;
-
 		match <Self as Body>::poll_frame(self, cx) {
 			Poll::Pending => Poll::Pending,
 			Poll::Ready(None) => Poll::Ready(None),
 			Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
 			Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(match frame.into_data() {
-				// Unfortunately, we do have to do this 'copy_from_slice' because, even though we
-				// know `data` is `MaybeOwnedBuf<B::Data>`, we don't know if `B::Data` is 'static
-				// or not, and also VecDeque that it might contain (if it's already owned) is not
-				// necessarily contiguous in memory, so we need to copy it over anyways.
-				Ok(data) => Bytes::copy_from_slice(data.as_ref()),
+				Ok(data) => data,
 				Err(frame) => frame
 					.into_trailers()
 					.map(|trailers| {
@@ -296,7 +251,7 @@ where
 			})))
 		}
 	}
-}
+}*/
 
 /// A [`http_body::Body`] that contains no data and is always ready to return `None` when polled
 #[derive(Default)]
