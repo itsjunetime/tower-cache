@@ -233,7 +233,9 @@ type Resp<Body> = http::Response<MaybeCachedBody<Body>>;
 
 type CachedResp = Arc<RwLock<CachedRespInner>>;
 
-struct CachedRespInner {
+/// A cached response, generally used inside an Arc<RwLock<_>> (see [`CachedResp`]) to reduce lock
+/// contention
+pub struct CachedRespInner {
 	valid: Arc<AtomicBool>,
 	response: MaybeCompleteResponse
 }
