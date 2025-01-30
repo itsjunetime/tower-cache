@@ -54,20 +54,12 @@ pub mod options;
 /// - `Cache`: implementor of [`cache::Cache`] which will be created on a per-service basis to
 ///   cache the response per-service.
 /// - `Resp`, `RespPred`, `Req`, `ReqPred`: See the [`options::CacheOptions`] documentation
-pub struct CacheLayer<Body, Cache, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>
-{
-	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>,
-	_tys: PhantomData<(Req, Cache)>
+pub struct CacheLayer<Cache, RespPred, ReqPred> {
+	options: CacheOptions<RespPred, ReqPred>,
+	_tys: PhantomData<Cache>
 }
 
-impl<Body, Cache, RespPred, Req, ReqPred> Clone for CacheLayer<Body, Cache, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>
-{
+impl<Cache, RespPred, ReqPred> Clone for CacheLayer<Cache, RespPred, ReqPred> {
 	fn clone(&self) -> Self {
 		Self {
 			options: self.options.clone(),
@@ -76,13 +68,9 @@ where
 	}
 }
 
-impl<Body, Cache, RespPred, Req, ReqPred> CacheLayer<Body, Cache, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>
-{
+impl<Cache, RespPred, ReqPred> CacheLayer<Cache, RespPred, ReqPred> {
 	/// Create a new [`CacheLayer`] with the given options
-	pub fn new(options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>) -> Self {
+	pub fn new(options: CacheOptions<RespPred, ReqPred>) -> Self {
 		Self {
 			options,
 			_tys: PhantomData
@@ -90,15 +78,11 @@ where
 	}
 }
 
-impl<Body, Cache, RespPred, Req, ReqPred, Svc> Layer<Svc>
-	for CacheLayer<Body, Cache, RespPred, Req, ReqPred>
+impl<Cache, RespPred, ReqPred, Svc> Layer<Svc> for CacheLayer<Cache, RespPred, ReqPred>
 where
-	Svc: Service<Req>,
-	Cache: cache::Cache<CacheKey, CachedResp>,
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>
+	Cache: cache::Cache<CacheKey, CachedResp>
 {
-	type Service = CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>;
+	type Service = CacheService<Cache, RespPred, ReqPred, Svc>;
 
 	fn layer(&self, inner: Svc) -> Self::Service {
 		CacheService {
@@ -120,23 +104,15 @@ where
 ///   response which it may or may not cache.
 /// - `RespPred`, `Req`, `ReqPred`: See [`options::CacheOptions`] documentation. The missing `Resp`
 ///   type is just [`Svc::Response`](tower_service::Service::Response)
-pub struct CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>
-where
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>,
-	Svc: Service<Req>
-{
+pub struct CacheService<Cache, RespPred, ReqPred, Svc> {
 	inner: Svc,
 	cache: Cache,
-	options: CacheOptions<Resp<Body>, RespPred, Req, ReqPred>
+	options: CacheOptions<RespPred, ReqPred>
 }
 
-impl<Body, Cache, RespPred, Req, ReqPred, Svc> Clone
-	for CacheService<Body, Cache, RespPred, Req, ReqPred, Svc>
+impl<Cache, RespPred, ReqPred, Svc> Clone for CacheService<Cache, RespPred, ReqPred, Svc>
 where
-	RespPred: Predicate<Resp<Body>>,
-	ReqPred: Predicate<Req>,
-	Svc: Service<Req> + Clone,
+	Svc: Clone,
 	Cache: Clone
 {
 	fn clone(&self) -> Self {
@@ -149,7 +125,7 @@ where
 }
 
 impl<Body, Cache, RespPred, Req, ReqPred, Svc> Service<Request<Req>>
-	for CacheService<Body, Cache, RespPred, Request<Req>, ReqPred, Svc>
+	for CacheService<Cache, RespPred, ReqPred, Svc>
 where
 	Svc: Service<Request<Req>, Response = http::Response<Body>>,
 	Body: http_body::Body,

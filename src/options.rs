@@ -1,6 +1,6 @@
 //! Options for configuring how the [`crate::CacheLayer`] and [`crate::CacheService`] should work
 
-use std::{marker::PhantomData, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use crate::invalidator::Invalidator;
 
@@ -18,11 +18,7 @@ use crate::invalidator::Invalidator;
 ///   but that is also generic over another requet type, so that will depend on what other
 ///   libraries you're using
 /// - `ReqPred`: The [`Predicate`] over `Req`, used for [req_pred](CacheOptions::req_pred).
-pub struct CacheOptions<Resp, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp>,
-	ReqPred: Predicate<Req>
-{
+pub struct CacheOptions<RespPred, ReqPred> {
 	/// A predicate that, if it is [`Some`], will restrict what responses are cached based on this
 	/// predicate, which will operate on the response itself. See the [`Predicate`] trait for more
 	/// information.
@@ -37,37 +33,26 @@ where
 	/// predicate, which will operate on the request which was given to generate that response. See
 	/// the [`Predicate`] trait for more information.
 	pub req_pred: Option<Arc<ReqPred>>,
-	pub(crate) invalidator: Invalidator,
-	_response: PhantomData<(Resp, Req)>
+	pub(crate) invalidator: Invalidator
 }
 
-impl<Resp, RespPred, Req, ReqPred> Clone for CacheOptions<Resp, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp>,
-	ReqPred: Predicate<Req>
-{
+impl<RespPred, ReqPred> Clone for CacheOptions<RespPred, ReqPred> {
 	fn clone(&self) -> Self {
 		Self {
 			resp_pred: self.resp_pred.clone(),
 			req_pred: self.req_pred.clone(),
-			invalidator: self.invalidator.clone(),
-			_response: PhantomData
+			invalidator: self.invalidator.clone()
 		}
 	}
 }
 
-impl<Resp, RespPred, Req, ReqPred> CacheOptions<Resp, RespPred, Req, ReqPred>
-where
-	RespPred: Predicate<Resp>,
-	ReqPred: Predicate<Req>
-{
+impl<RespPred, ReqPred> CacheOptions<RespPred, ReqPred> {
 	/// Create a new [`CacheOptions`] with the given `resp_pred` and `req_pred`
 	pub fn new(resp_pred: Option<RespPred>, req_pred: Option<ReqPred>) -> Self {
 		Self {
 			resp_pred: resp_pred.map(Arc::new),
 			req_pred: req_pred.map(Arc::new),
-			invalidator: Invalidator::default(),
-			_response: PhantomData
+			invalidator: Invalidator::default()
 		}
 	}
 
