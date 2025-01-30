@@ -63,22 +63,15 @@ impl Invalidator {
 #[cfg(feature = "axum")]
 impl<T> axum::extract::FromRequestParts<T> for Invalidator
 where
+	T: Sync,
 	Invalidator: axum::extract::FromRef<T>
 {
 	type Rejection = core::convert::Infallible;
 
-	fn from_request_parts<'life0, 'life1, 'async_trait>(
-		_parts: &'life0 mut http::request::Parts,
-		state: &'life1 T
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = Result<Self, Self::Rejection>> + Send + 'async_trait>
-	>
-	where
-		Self: 'async_trait,
-		'life0: 'async_trait,
-		'life1: 'async_trait
-	{
-		let new = <Invalidator as axum::extract::FromRef<T>>::from_ref(state);
-		Box::pin(async move { Ok(new) })
+	async fn from_request_parts(
+		_parts: &mut http::request::Parts,
+		state: &T
+	) -> Result<Self, Self::Rejection> {
+		Ok(<Invalidator as axum::extract::FromRef<T>>::from_ref(state))
 	}
 }

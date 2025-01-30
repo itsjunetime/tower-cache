@@ -98,9 +98,7 @@ impl<B: Body> Body for CacheStreamBody<B> {
 								}
 
 								resp.data.extend(vec.iter());
-								return Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(
-									vec
-								)))));
+								return Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(vec)))));
 							}
 							Err(frame) => {
 								if let Some(trailers) = frame.trailers_ref() {
