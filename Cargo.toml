@@ -9,15 +9,15 @@ name = "tower_cache"
 [dependencies]
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
-http = "1.1.0"
-dashmap = { version = "6.1.0", optional = true }
-pin-project-lite = "0.2.15"
+http = "1"
+dashmap = { version = "6", optional = true }
+pin-project-lite = "0.2"
 axum = { version = "0.8", optional = true }
-futures-core = { version = "0.3.31", optional = true }
-segvec = { version = "0.2.0", features = ["small-vec", "thin-segments"] }
-http-body = "1.0.1"
-bytes = "1.9.0"
-atomic-wait = "1.1.0"
+futures-core = { version = "0.3", optional = true }
+segvec = { version = "0.2", features = ["small-vec", "thin-segments"] }
+http-body = "1"
+bytes = "1"
+atomic-wait = "1"
 
 [features]
 default = ["axum"]
