@@ -14,19 +14,45 @@ use http_body::{Body, Frame};
 
 use crate::{CachedResp, CachedRespInner, MaybeCompleteResponse, PartialResponse};
 
-pin_project_lite::pin_project! {
-	/// A struct wrapping an implementor of [`Body`] which copies all data and trailers returned
-	/// from the wrapped Body so that it can be cached and returned easily at a later date
-	///
-	/// [`Body`]: http_body::Body
-	pub struct CacheStreamBody<Body> {
-		#[pin]
-		pub(crate) inner: Body,
-		pub(crate) cache_entry: CachedResp
+/// A struct wrapping an implementor of [`Body`] which copies all data and trailers returned
+/// from the wrapped Body so that it can be cached and returned easily at a later date
+///
+/// [`Body`]: http_body::Body
+pub struct CacheStreamBody<Body> {
+	pub(crate) inner: Body,
+	pub(crate) cache_entry: CachedResp
+}
+
+impl<B> Drop for CacheStreamBody<B> {
+	fn drop(&mut self) {
+		let mut inner = self.cache_entry
+			.write()
+			.unwrap_or_else(PoisonError::into_inner);
+
+		let CachedRespInner {
+			ref valid,
+			response: MaybeCompleteResponse::Partial(ref mut resp)
+		} = *inner else {
+			return;
+		};
+
+		// if this is dropped while it's still a partial response, wake everyone else who's waiting
+		// on this and mark this response as invalid so next time somebody looks at this, they
+		// clear it and try again.
+		//
+		// Technically this could still cause a deadlock since destructors aren't guaranteed to be
+		// run. I'm just praying that all the libraries that use this struct don't forget it lmao
+		valid.store(false, Ordering::Relaxed);
+		resp.cond_var.store(1, Ordering::Release);
 	}
 }
 
-impl<B: Body> Body for CacheStreamBody<B> {
+/// This `CachedResp: Unpin` bound is necessary for the `unsafe` blocks in the `poll_frame` body to
+/// be sound. Specifically, we pull out both fields of `Self`, then re-pin `inner` so that we can
+/// poll it. We don't repin CachedResp 'cause we need to call stuff on it. We could re-pin it, then
+/// try to get it out safely, which would only compile as long as `CachedResp` implements `Unpin`
+/// anyways. So I feel like this is an easier way to signify that requirement.
+impl<B: Body> Body for CacheStreamBody<B> where CachedResp: Unpin {
 	type Data = Bytes;
 	type Error = B::Error;
 
@@ -34,11 +60,21 @@ impl<B: Body> Body for CacheStreamBody<B> {
 		self: Pin<&mut Self>,
 		cx: &mut Context<'_>
 	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-		let proj = self.project();
-		match proj.inner.poll_frame(cx) {
+
+		// SAFETY: So ideally we would slap the `pin_project` macro on top of this struct, but that
+		// requires that `Self` not implement `Drop` so that they can do special drop glue to make
+		// it all work for every time which may use that macro. However, we know that we need to
+		// implement `Drop` for ourselves (to do the cond_var setting), so we can't use that macro.
+		//
+		// So. This is safe because we make sure that we don't overwrite `inner`. We're just
+		// getting them out and immediatelly re-pinning `inner` so that we can poll it. That's
+		// perfectly sound, as far as I've been able to tell.
+		let Self { ref mut inner, ref mut cache_entry } = unsafe { self.get_unchecked_mut() };
+		let inner = unsafe { Pin::new_unchecked(inner) };
+
+		match inner.poll_frame(cx) {
 			Poll::Ready(frame_res_opt) => {
-				let mut inner = proj
-					.cache_entry
+				let mut inner = cache_entry
 					.write()
 					.unwrap_or_else(PoisonError::into_inner);
 
