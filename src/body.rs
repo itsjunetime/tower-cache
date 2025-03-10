@@ -4,7 +4,7 @@ use std::{
 	collections::VecDeque,
 	convert::Infallible,
 	pin::Pin,
-	sync::{atomic::Ordering, PoisonError},
+	sync::{PoisonError, atomic::Ordering},
 	task::{Context, Poll}
 };
 
@@ -25,14 +25,16 @@ pub struct CacheStreamBody<Body> {
 
 impl<B> Drop for CacheStreamBody<B> {
 	fn drop(&mut self) {
-		let mut inner = self.cache_entry
+		let mut inner = self
+			.cache_entry
 			.write()
 			.unwrap_or_else(PoisonError::into_inner);
 
 		let CachedRespInner {
 			ref valid,
 			response: MaybeCompleteResponse::Partial(ref mut resp)
-		} = *inner else {
+		} = *inner
+		else {
 			return;
 		};
 
@@ -52,7 +54,10 @@ impl<B> Drop for CacheStreamBody<B> {
 /// poll it. We don't repin CachedResp 'cause we need to call stuff on it. We could re-pin it, then
 /// try to get it out safely, which would only compile as long as `CachedResp` implements `Unpin`
 /// anyways. So I feel like this is an easier way to signify that requirement.
-impl<B: Body> Body for CacheStreamBody<B> where CachedResp: Unpin {
+impl<B: Body> Body for CacheStreamBody<B>
+where
+	CachedResp: Unpin
+{
 	type Data = Bytes;
 	type Error = B::Error;
 
@@ -60,7 +65,6 @@ impl<B: Body> Body for CacheStreamBody<B> where CachedResp: Unpin {
 		self: Pin<&mut Self>,
 		cx: &mut Context<'_>
 	) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-
 		// SAFETY: So ideally we would slap the `pin_project` macro on top of this struct, but that
 		// requires that `Self` not implement `Drop` so that they can do special drop glue to make
 		// it all work for every time which may use that macro. However, we know that we need to
@@ -69,14 +73,12 @@ impl<B: Body> Body for CacheStreamBody<B> where CachedResp: Unpin {
 		// So. This is safe because we make sure that we don't overwrite `inner`. We're just
 		// getting them out and immediatelly re-pinning `inner` so that we can poll it. That's
 		// perfectly sound, as far as I've been able to tell.
-		let Self { ref mut inner, ref mut cache_entry } = unsafe { self.get_unchecked_mut() };
+		let Self { inner, cache_entry } = unsafe { self.get_unchecked_mut() };
 		let inner = unsafe { Pin::new_unchecked(inner) };
 
 		match inner.poll_frame(cx) {
 			Poll::Ready(frame_res_opt) => {
-				let mut inner = cache_entry
-					.write()
-					.unwrap_or_else(PoisonError::into_inner);
+				let mut inner = cache_entry.write().unwrap_or_else(PoisonError::into_inner);
 
 				let CachedRespInner {
 					response: MaybeCompleteResponse::Partial(ref mut resp),

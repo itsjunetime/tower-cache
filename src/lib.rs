@@ -8,7 +8,7 @@ use core::{
 	sync::atomic::{AtomicBool, Ordering},
 	task::{Context, Poll}
 };
-use std::sync::{atomic::AtomicU32, Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, atomic::AtomicU32};
 
 use body::{CacheStreamBody, CachedBody, MaybeCachedBody, NoOpBody};
 use bytes::BytesMut;
@@ -216,9 +216,6 @@ pub struct CachedRespInner {
 	response: MaybeCompleteResponse
 }
 
-/// I would like to work around this but boxing stuff makes types in trait implementations
-/// difficult... hmmmmmm
-#[expect(clippy::large_enum_variant)]
 enum MaybeCompleteResponse {
 	Nothing,
 	Partial(PartialResponse),
