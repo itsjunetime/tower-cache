@@ -68,7 +68,7 @@ where
 		V: 'guard;
 
 	fn get<'s>(&'s self, key: &K) -> Option<Self::GetGuard<'s>> {
-		RwLockReadGuard::try_map(
+		RwLockReadGuard::filter_map(
 			self.0.read().unwrap_or_else(PoisonError::into_inner),
 			|cache| cache.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 		)
@@ -81,7 +81,7 @@ where
 		V: 'guard;
 
 	fn get_mut<'s>(&'s mut self, key: &K) -> Option<Self::GetMutGuard<'s>> {
-		RwLockWriteGuard::try_map(
+		RwLockWriteGuard::filter_map(
 			self.0.write().unwrap_or_else(PoisonError::into_inner),
 			|cache| cache.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
 		)
